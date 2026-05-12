@@ -12,8 +12,10 @@
  *   - After hydration, auto-saves callState / inventory / detectedState
  *     whenever they change. No save during hydration (would overwrite
  *     stored values with empty defaults on first render).
+ *   - Starts the outbox flusher on mount so queued ER alerts drain
+ *     automatically as soon as connectivity returns.
  *
- * GPS-based state detection and outbox flushing land in later phases.
+ * GPS-based state detection lands in a later phase.
  */
 
 import React, {
@@ -31,6 +33,7 @@ import React, {
     PatientVitals,
   } from '../types';
   import { load, save, StorageKeys } from '../storage/localStorage';
+  import { startOutboxFlusher } from '../storage/outbox';
   
   // --- Defaults ------------------------------------------------------------
   
@@ -145,6 +148,17 @@ import React, {
       return () => {
         cancelled = true;
       };
+    }, []);
+  
+    // ---- Outbox flusher: start once on mount -----------------------------
+  
+    // Drains queued ER alerts on an interval + on connectivity changes.
+    // Cleanup is what startOutboxFlusher returns — clears interval and
+    // unsubscribes from NetInfo. In practice the provider never unmounts,
+    // but returning the cleanup keeps the contract honest.
+    useEffect(() => {
+      const stop = startOutboxFlusher();
+      return stop;
     }, []);
   
     // ---- Auto-save: write to storage when state changes ------------------

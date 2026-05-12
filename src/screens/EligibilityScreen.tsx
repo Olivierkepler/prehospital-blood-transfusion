@@ -7,16 +7,18 @@
  *   2. Vitals form    — required + optional inputs, live recomputation
  *   3. Eligibility    — verdict, shock index, reasons, unit picker
  *   4. Risk score     — Models 1+2 outputs with honest framing
+ *   5. Save button    — commits current vitals + eligibility into callState
+ *                       so the Alert screen has something to read
  *
  * Live computation: every input change re-runs the rules engine and the
  * full ML assessment via useMemo. Pure functions make this cheap.
  *
  * Note on persistence: form state (vitals + optional inputs) is local to
- * this screen. The selected blood unit IS persisted to callState because
- * it's set via tap, not via render. When the Alert screen needs vitals
- * in Phase 5, we'll either lift form state to context or add an explicit
- * "Save vitals" action — both avoid the render-loop hazard of useEffect-
- * based syncing of derived state.
+ * this screen. Persisting via useEffect-on-derived-value creates a
+ * derive→write→re-render→derive loop (we tried, it crashes). Instead, the
+ * "Save for ER alert" button explicitly copies the current vitals and
+ * eligibility result into callState on tap. The selected blood unit IS
+ * persisted via setSelectedBloodUnit because it's set via tap, not derived.
  */
 
 import React, { useMemo, useState } from 'react';
@@ -59,6 +61,8 @@ export default function EligibilityScreen() {
     bloodInventory,
     detectedState,
     setSelectedBloodUnit,
+    setPatientVitals,
+    setEligibilityResult,
   } = useApp();
 
   // Local input state (strings, because TextInput is string-based).
@@ -76,6 +80,9 @@ export default function EligibilityScreen() {
   const [minutesToHospitalInput, setMinutesToHospitalInput] = useState('');
 
   const [infoModalVisible, setInfoModalVisible] = useState(false);
+
+  // Save button status — flashes green for 1.5s after tap.
+  const [saveStatus, setSaveStatus] = useState<'idle' | 'saved'>('idle');
 
   // Parse inputs once per render.
   const hr = parseNumber(hrInput);
@@ -130,6 +137,19 @@ export default function EligibilityScreen() {
   // --- State protocol --------------------------------------------------
 
   const stateProtocol = STATE_PROTOCOLS[detectedState.trim()];
+
+  // --- Save action -----------------------------------------------------
+
+  // Explicit "commit current inputs to callState" so the Alert screen has
+  // something to read. Called on tap; no useEffect-based syncing because
+  // that creates a derive→write→re-render→derive loop.
+  const handleSave = () => {
+    if (!vitals || !eligibility) return;
+    setPatientVitals(vitals);
+    setEligibilityResult(eligibility);
+    setSaveStatus('saved');
+    setTimeout(() => setSaveStatus('idle'), 1500);
+  };
 
   return (
     <ScrollView
@@ -282,6 +302,28 @@ export default function EligibilityScreen() {
         visible={infoModalVisible}
         onClose={() => setInfoModalVisible(false)}
       />
+
+      {/* 5. Save button — only visible when vitals + eligibility are ready */}
+      {vitals && eligibility && (
+        <Pressable
+          style={({ pressed }) => [
+            styles.saveButton,
+            saveStatus === 'saved' && styles.saveButtonSaved,
+            pressed && { opacity: 0.85 },
+          ]}
+          onPress={saveStatus === 'idle' ? handleSave : undefined}
+          disabled={saveStatus !== 'idle'}
+        >
+          <Ionicons
+            name={saveStatus === 'saved' ? 'checkmark' : 'save-outline'}
+            size={18}
+            color="#fff"
+          />
+          <Text style={styles.saveButtonText}>
+            {saveStatus === 'saved' ? 'Saved for ER alert' : 'Save for ER alert'}
+          </Text>
+        </Pressable>
+      )}
     </ScrollView>
   );
 }
@@ -1005,6 +1047,26 @@ const styles = StyleSheet.create({
     color: Colors.textMuted,
     fontStyle: 'italic',
     textAlign: 'center',
+  },
+
+  // Save button (new)
+  saveButton: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 14,
+    borderRadius: 14,
+    backgroundColor: Colors.primary,
+    marginTop: 4,
+  },
+  saveButtonSaved: {
+    backgroundColor: Colors.success,
+  },
+  saveButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '800',
   },
 
   // Info modal

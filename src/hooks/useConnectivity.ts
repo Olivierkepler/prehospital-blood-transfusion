@@ -5,7 +5,7 @@
  *   - isOffline: boolean for offline-aware rendering
  *   - signalLabel: "5G" / "LTE" / "WiFi" / "Offline" / etc., for the header pill
  *   - signalColor: pill color matching signal quality
- *   - pendingAlerts: count of queued ER alerts (stubbed until outbox.ts exists)
+ *   - pendingAlerts: count of queued ER alerts (from the outbox)
  *
  * One subscription per app instance — multiple components can call this hook
  * cheaply because NetInfo broadcasts state changes to all listeners.
@@ -17,6 +17,7 @@ import NetInfo, {
   NetInfoStateType,
 } from '@react-native-community/netinfo';
 import { Colors } from '../theme/colors';
+import { getPendingCount } from '../storage/outbox';
 
 /** How often to refresh pendingAlerts count from the outbox, in ms. */
 const PENDING_POLL_INTERVAL_MS = 5000;
@@ -72,15 +73,6 @@ function classifySignal(state: NetInfoState): {
 
   // unknown, none, bluetooth, vpn, wimax, other
   return { label: 'Online', color: Colors.info };
-}
-
-/**
- * STUB — replaced by real outbox query in Phase 5.
- * Returns 0 so the UI renders correctly until the outbox exists.
- */
-async function getPendingCount(): Promise<number> {
-  // TODO(phase-5): import { getPendingCount } from '../storage/outbox';
-  return 0;
 }
 
 export function useConnectivity(): ConnectivityState {
