@@ -19,6 +19,7 @@ import {
   StyleSheet,
   Text,
   View,
+  Image
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -133,7 +134,7 @@ export default function InventoryScreen() {
           onPress={() => setFilter('expiring')}
         />
         <FilterPill
-          label="Problems"
+          label="Probs"
           count={counts.problem}
           active={filter === 'problem'}
           tone="danger"
@@ -141,7 +142,7 @@ export default function InventoryScreen() {
         />
       </View>
 
-      <ScrollView
+      <ScrollView 
         contentContainerStyle={styles.listContent}
         showsVerticalScrollIndicator={false}
       >
@@ -290,6 +291,15 @@ function UnitCard({
           )}
         </View>
 
+        <Image
+          source={require('../../assets/images/bloodbag.png')}
+          style={{ width: 48, height: 48, borderRadius: 8, marginTop: 4 }}
+          resizeMode="cover"
+        />
+  
+
+
+
         <View style={styles.metaRow}>
           <Ionicons name="calendar-outline" size={12} color={Colors.textMuted} />
           <Text style={styles.metaText}>{unit.expiryDate}</Text>
@@ -379,9 +389,18 @@ function EmptyState({ filter, total }: { filter: Filter; total: number }) {
 // --- Styles -------------------------------------------------------------
 
 const styles = StyleSheet.create({
+  
   root: {
     flex: 1,
+    marginVertical: 100,
+    marginBottom: 40,
     backgroundColor: Colors.background,
+  borderTopLeftRadius: 28,
+  borderTopRightRadius: 28,
+  // "translate top a bit" and add zIndex
+  marginTop: 110,
+  zIndex: 1,
+
   },
 
   filterBar: {
@@ -440,6 +459,8 @@ const styles = StyleSheet.create({
     padding: 12,
     paddingBottom: 100, // room for FAB
     gap: 10,
+
+    
   },
 
   card: {
@@ -554,7 +575,7 @@ const styles = StyleSheet.create({
 
   fab: {
     position: 'absolute',
-    bottom: 20,
+    bottom: 80,
     right: 20,
     width: 56,
     height: 56,

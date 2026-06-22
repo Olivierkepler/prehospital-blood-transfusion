@@ -2,7 +2,8 @@
  * AppContext — global state for the prehospital blood transfusion app.
  *
  * What it owns:
- *   - callState:        active encounter (vitals, eligibility, selected unit)
+ *   - callState:        active encounter (patient name, vitals, eligibility,
+ *                       selected unit, transfusion progress)
  *   - bloodInventory:   list of blood units currently on the truck
  *   - detectedState:    US state used for protocol lookup
  *   - isLoading:        true until AsyncStorage hydration finishes
@@ -14,6 +15,9 @@
  *     stored values with empty defaults on first render).
  *   - Starts the outbox flusher on mount so queued ER alerts drain
  *     automatically as soon as connectivity returns.
+ *   - Hydration is forward-compatible: old persisted callState objects
+ *     missing newer fields (patientName, transfusion) are filled in
+ *     from DEFAULT_CALL_STATE so they don't crash on read.
  *
  * GPS-based state detection lands in a later phase.
  */
@@ -31,18 +35,32 @@ import React, {
     CallState,
     EligibilityResult,
     PatientVitals,
+    TransfusionState,
   } from '../types';
   import { load, save, StorageKeys } from '../storage/localStorage';
   import { startOutboxFlusher } from '../storage/outbox';
   
   // --- Defaults ------------------------------------------------------------
   
+  const DEFAULT_TRANSFUSION_STATE: TransfusionState = {
+    active: false,
+    startedAt: null,
+    elapsedSec: 0,
+    volumeInfusedMl: 0,
+    peakSeverity: 'none',
+    peakReactionType: null,
+    peakObservedAt: null,
+    medicNote: '',
+  };
+  
   const DEFAULT_CALL_STATE: CallState = {
     active: false,
     startTime: null,
+    patientName: '',
     patientVitals: null,
     eligibilityResult: null,
     selectedBloodUnit: null,
+    transfusion: DEFAULT_TRANSFUSION_STATE,
   };
   
   /**
@@ -82,9 +100,11 @@ import React, {
     endCall: () => void;
   
     // Per-field mutators on the active call
+    setPatientName: (name: string) => void;
     setPatientVitals: (vitals: PatientVitals) => void;
     setEligibilityResult: (result: EligibilityResult) => void;
     setSelectedBloodUnit: (unit: BloodUnit | null) => void;
+    setTransfusionState: (next: Partial<TransfusionState>) => void;
   
     // Inventory
     addBloodUnit: (unit: BloodUnit) => void;
@@ -126,14 +146,28 @@ import React, {
       const hydrate = async () => {
         // Parallel reads — three independent keys, no reason to serialize.
         const [storedCall, storedInventory, storedState] = await Promise.all([
-          load<CallState>(StorageKeys.callState),
+          load<Partial<CallState>>(StorageKeys.callState),
           load<BloodUnit[]>(StorageKeys.inventory),
           load<string>(StorageKeys.detectedState),
         ]);
   
         if (cancelled) return;
   
-        if (storedCall) setCallState(storedCall);
+        if (storedCall) {
+          // Migrate forward: persisted state from an older app version may
+          // be missing newer fields (patientName, transfusion). Spread
+          // DEFAULT_CALL_STATE first so missing fields fall through to
+          // defaults, then layer the stored fields on top. The nested
+          // transfusion object needs its own merge for the same reason.
+          setCallState({
+            ...DEFAULT_CALL_STATE,
+            ...storedCall,
+            transfusion: {
+              ...DEFAULT_TRANSFUSION_STATE,
+              ...(storedCall.transfusion ?? {}),
+            },
+          });
+        }
         if (storedInventory) setBloodInventory(storedInventory);
         if (storedState) setDetectedStateRaw(storedState);
   
@@ -196,6 +230,10 @@ import React, {
       setCallState(DEFAULT_CALL_STATE);
     };
   
+    const setPatientName = (name: string) => {
+      setCallState((prev) => ({ ...prev, patientName: name }));
+    };
+  
     const setPatientVitals = (vitals: PatientVitals) => {
       setCallState((prev) => ({ ...prev, patientVitals: vitals }));
     };
@@ -206,6 +244,13 @@ import React, {
   
     const setSelectedBloodUnit = (unit: BloodUnit | null) => {
       setCallState((prev) => ({ ...prev, selectedBloodUnit: unit }));
+    };
+  
+    const setTransfusionState = (next: Partial<TransfusionState>) => {
+      setCallState((prev) => ({
+        ...prev,
+        transfusion: { ...prev.transfusion, ...next },
+      }));
     };
   
     const addBloodUnit = (unit: BloodUnit) => {
@@ -231,9 +276,11 @@ import React, {
       isLoading,
       startCall,
       endCall,
+      setPatientName,
       setPatientVitals,
       setEligibilityResult,
       setSelectedBloodUnit,
+      setTransfusionState,
       addBloodUnit,
       removeBloodUnit,
       setDetectedState,

@@ -30,8 +30,10 @@ import {
   Text,
   TextInput,
   View,
+  Image
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+
 
 import { Colors } from '../theme/colors';
 import { useApp } from '../context/AppContext';
@@ -61,11 +63,16 @@ export default function EligibilityScreen() {
     bloodInventory,
     detectedState,
     setSelectedBloodUnit,
+    setPatientName,
     setPatientVitals,
     setEligibilityResult,
   } = useApp();
 
   // Local input state (strings, because TextInput is string-based).
+  // Patient name — local input mirror of callState.patientName. Synced
+  // to context on save like the vitals, not on every keystroke, so
+  // hydration doesn't fight a typing user.
+  const [nameInput, setNameInput] = useState(callState.patientName);
   const [hrInput, setHrInput] = useState('');
   const [sbpInput, setSbpInput] = useState('');
   const [mechanism, setMechanism] = useState<InjuryType>('blunt');
@@ -145,6 +152,7 @@ export default function EligibilityScreen() {
   // that creates a derive→write→re-render→derive loop.
   const handleSave = () => {
     if (!vitals || !eligibility) return;
+    setPatientName(nameInput.trim());
     setPatientVitals(vitals);
     setEligibilityResult(eligibility);
     setSaveStatus('saved');
@@ -165,116 +173,177 @@ export default function EligibilityScreen() {
       />
 
       {/* 2. Vitals form */}
-      <View style={styles.card}>
-        <Text style={styles.cardTitle}>Patient vitals</Text>
+    {/* 2. Vitals form */}
+<View style={styles.card}>
+  <View style={styles.cardHeader}>
+    <Text style={styles.cardTitle}>Patient vitals</Text>
+  </View>
 
-        <View style={styles.fieldRow}>
-          <NumberField
-            label="Heart rate"
-            unit="bpm"
-            value={hrInput}
-            onChange={setHrInput}
-            required
-          />
-          <NumberField
-            label="Systolic BP"
-            unit="mmHg"
-            value={sbpInput}
-            onChange={setSbpInput}
-            required
-          />
-        </View>
+  <View style={styles.monitorImageWrap}>
+    <Image
+      source={require('../../assets/images/patientMonitor.png')}
+      style={styles.monitorImage}
+      accessibilityLabel="Patient monitor"
+    />
+  </View>
 
-        <Text style={styles.fieldLabel}>Mechanism</Text>
-        <View style={styles.chipRow}>
-          {(['blunt', 'penetrating', 'other'] as InjuryType[]).map((m) => (
-            <Pressable
-              key={m}
-              style={[
-                styles.chip,
-                mechanism === m && styles.chipActive,
-              ]}
-              onPress={() => setMechanism(m)}
-            >
-              <Text
-                style={[
-                  styles.chipText,
-                  mechanism === m && styles.chipTextActive,
-                ]}
-              >
-                {m[0].toUpperCase() + m.slice(1)}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
+  <View style={styles.nameField}>
+    <Text style={styles.fieldLabel}>
+      Patient name optional
+    </Text>
 
+    <TextInput
+      style={styles.nameInput}
+      value={nameInput}
+      onChangeText={setNameInput}
+      placeholder="e.g. Mr. Smith"
+      placeholderTextColor={Colors.textMuted}
+      autoCorrect={false}
+      autoCapitalize="words"
+    />
+  </View>
+
+  <View style={styles.fieldRow}>
+    <NumberField
+      label="Heart rate"
+      unit="bpm"
+      value={hrInput}
+      onChange={setHrInput}
+      required
+    />
+
+    <NumberField
+      label="Systolic BP"
+      unit="mmHg"
+      value={sbpInput}
+      onChange={setSbpInput}
+      required
+    />
+  </View>
+
+  <Text style={styles.fieldLabel}>
+    Mechanism
+  </Text>
+
+  <View style={styles.chipRow}>
+    {(['blunt', 'penetrating', 'other'] as InjuryType[]).map((m) => {
+      const isActive = mechanism === m;
+
+      return (
         <Pressable
-          style={styles.expandRow}
-          onPress={() => setShowOptional((v) => !v)}
+          key={m}
+          style={[
+            styles.chip,
+            isActive && styles.chipActive,
+          ]}
+          onPress={() => setMechanism(m)}
         >
-          <Ionicons
-            name={showOptional ? 'chevron-up' : 'chevron-down'}
-            size={16}
-            color={Colors.primary}
-          />
-          <Text style={styles.expandText}>
-            {showOptional ? 'Hide additional inputs' : 'Show additional inputs'}
+          <Text
+            style={[
+              styles.chipText,
+              isActive && styles.chipTextActive,
+            ]}
+          >
+            {m[0].toUpperCase() + m.slice(1)}
           </Text>
         </Pressable>
+      );
+    })}
+  </View>
 
-        {showOptional && (
-          <View style={styles.optionalSection}>
-            <View style={styles.fieldRow}>
-              <NumberField
-                label="Resp. rate"
-                unit="/min"
-                value={rrInput}
-                onChange={setRrInput}
-              />
-              <NumberField
-                label="GCS"
-                unit="3–15"
-                value={gcsInput}
-                onChange={setGcsInput}
-              />
-            </View>
-            <View style={styles.fieldRow}>
-              <NumberField
-                label="SpO₂"
-                unit="%"
-                value={spo2Input}
-                onChange={setSpo2Input}
-              />
-              <NumberField
-                label="Age"
-                unit="yrs"
-                value={ageInput}
-                onChange={setAgeInput}
-              />
-            </View>
-            <View style={styles.fieldRow}>
-              <NumberField
-                label="Min. since injury"
-                unit="min"
-                value={minutesSinceInjuryInput}
-                onChange={setMinutesSinceInjuryInput}
-              />
-              <NumberField
-                label="ETA to hospital"
-                unit="min"
-                value={minutesToHospitalInput}
-                onChange={setMinutesToHospitalInput}
-                placeholder={String(DEFAULT_MINUTES_TO_HOSPITAL)}
-              />
-            </View>
-          </View>
-        )}
+  <Pressable
+    style={styles.expandRow}
+    onPress={() =>
+      setShowOptional((value) => !value)
+    }
+  >
+    <View style={styles.expandLeft}>
+      <Ionicons
+        name={
+          showOptional
+            ? 'chevron-up'
+            : 'chevron-down'
+        }
+        size={16}
+        color={Colors.primary}
+      />
+
+      <Text style={styles.expandText}>
+        {showOptional
+          ? 'Hide advanced vitals'
+          : 'Show advanced vitals'}
+      </Text>
+    </View>
+  </Pressable>
+
+  {showOptional && (
+    <View style={styles.optionalSection}>
+      <View style={styles.fieldRow}>
+        <NumberField
+          label="Resp. rate"
+          unit="/min"
+          value={rrInput}
+          onChange={setRrInput}
+        />
+
+        <NumberField
+          label="GCS"
+          unit="3–15"
+          value={gcsInput}
+          onChange={setGcsInput}
+        />
       </View>
+
+      <View style={styles.fieldRow}>
+        <NumberField
+          label="SpO₂"
+          unit="%"
+          value={spo2Input}
+          onChange={setSpo2Input}
+        />
+
+        <NumberField
+          label="Age"
+          unit="yrs"
+          value={ageInput}
+          onChange={setAgeInput}
+        />
+      </View>
+
+      <View style={styles.fieldRow}>
+        <NumberField
+          label="Min. since injury"
+          unit="min"
+          value={minutesSinceInjuryInput}
+          onChange={setMinutesSinceInjuryInput}
+        />
+
+        <NumberField
+          label="ETA to hospital"
+          unit="min"
+          value={minutesToHospitalInput}
+          onChange={setMinutesToHospitalInput}
+          placeholder={String(DEFAULT_MINUTES_TO_HOSPITAL)}
+        />
+      </View>
+    </View>
+  )}
+</View>
 
       {/* 3. Eligibility card */}
       {!vitals ? (
         <View style={[styles.card, styles.placeholderCard]}>
-          <Ionicons name="clipboard-outline" size={32} color={Colors.textMuted} />
+          {/* <Ionicons name="clipboard-outline" size={32} color={Colors.textMuted} />
+           */}
+          <Image
+            source={require('../../assets/images/clipboard.png')}
+            style={{ width: 54, height: 54, marginBottom: 12 }}
+            accessibilityLabel="Clipboard"
+          />
+    
+
+          
+          
           <Text style={styles.placeholderTitle}>Enter HR and SBP to begin</Text>
           <Text style={styles.placeholderBody}>
             Heart rate and systolic blood pressure are required to compute
@@ -355,7 +424,7 @@ function ProtocolHeader({
     <View
       style={[
         styles.protocolHeader,
-        { borderColor: color, backgroundColor: `${color}14` },
+      
       ]}
     >
       <Ionicons name={icon} size={16} color={color} />
@@ -430,20 +499,34 @@ function EligibilityCard({
   return (
     <View style={styles.card}>
       <View style={styles.verdictRow}>
-        <View
-          style={[
-            styles.verdictBadge,
-            { backgroundColor: `${verdictColor}1A`, borderColor: verdictColor },
-          ]}
-        >
-          <Ionicons name={verdictIcon} size={20} color={verdictColor} />
-          <Text style={[styles.verdictText, { color: verdictColor }]}>
-            {verdictLabel}
-          </Text>
+      <View
+  style={[
+    styles.verdictBadge,
+    {
+      backgroundColor: Colors.primary,
+      shadowColor: Colors.primary,
+      shadowOffset: {
+        width: 0,
+        height: 4,
+      },
+      shadowOpacity: 0.18,
+      shadowRadius: 10,
+      elevation: 3,
+    },
+  ]}
+>
+<Ionicons name={verdictIcon} size={20} color="#fff" />
+
+<Text style={[styles.verdictText, { color: '#fff' }]}>
+  {verdictLabel}
+</Text>
         </View>
+
+
+
         <View style={styles.shockIndexBox}>
           <Text style={styles.shockIndexLabel}>Shock index</Text>
-          <Text style={[styles.shockIndexValue, { color: shockColor }]}>
+          <Text style={[styles.shockIndexValue, { color: "black" }]}>
             {formatShockIndex(eligibility.shockIndex)}
           </Text>
         </View>
@@ -559,7 +642,7 @@ function RiskScoreCard({
 
       <View style={styles.scoreRow}>
         <View style={styles.scoreBlock}>
-          <Text style={[styles.scoreNumber, { color: scoreColor }]}>
+          <Text style={[styles.scoreNumber]}>
             {shock.riskScore}
           </Text>
           <Text style={styles.scoreCaption}>
@@ -567,11 +650,20 @@ function RiskScoreCard({
           </Text>
         </View>
         <View style={styles.scoreMetaBlock}>
-          <Text style={styles.metaLabel}>Shock class</Text>
-          <Text style={styles.metaValue}>{shock.shockClass}</Text>
-          <Text style={styles.metaLabel}>Confidence</Text>
-          <Text style={styles.metaValue}>{shock.confidence}</Text>
-        </View>
+  <View style={styles.metaRow}>
+    <Text style={styles.metaLabel}>Shock class</Text>
+    <Text style={styles.metaValue}>
+      {shock.shockClass}
+    </Text>
+  </View>
+
+  <View style={styles.metaRow}>
+    <Text style={styles.metaLabel}>Confidence</Text>
+    <Text style={styles.metaValue}>
+      {shock.confidence}
+    </Text>
+  </View>
+</View>
       </View>
 
       {shock.topFactors.length > 0 && (
@@ -672,6 +764,11 @@ const styles = StyleSheet.create({
   scroll: {
     flex: 1,
     backgroundColor: Colors.background,
+    marginTop: 110,
+    marginBottom: 100,
+    zIndex: 1,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
   },
   scrollContent: {
     padding: 14,
@@ -679,12 +776,10 @@ const styles = StyleSheet.create({
     gap: 12,
   },
 
-  // Protocol header
   protocolHeader: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 8,
-    borderWidth: 1,
     borderRadius: 12,
     paddingHorizontal: 12,
     paddingVertical: 10,
@@ -705,13 +800,20 @@ const styles = StyleSheet.create({
     flex: 1,
   },
 
-  // Cards
   card: {
     backgroundColor: Colors.surface,
-    borderRadius: 16,
-    padding: 16,
+    borderRadius: 22,
+    padding: 18,
     borderWidth: 1,
     borderColor: Colors.border,
+    shadowColor: '#000',
+    shadowOffset: {
+      width: 0,
+      height: 8,
+    },
+    shadowOpacity: 0.05,
+    shadowRadius: 18,
+    elevation: 3,
   },
   placeholderCard: {
     alignItems: 'center',
@@ -735,19 +837,17 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
-    marginBottom: 12,
+    marginBottom: 6,
   },
   cardTitle: {
-    fontSize: 16,
-    fontWeight: '700',
+    fontSize: 17,
+    fontWeight: '800',
     color: Colors.text,
-    marginBottom: 12,
   },
   infoButton: {
     marginBottom: 12,
   },
 
-  // Fields
   fieldRow: {
     flexDirection: 'row',
     gap: 10,
@@ -772,12 +872,14 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     backgroundColor: Colors.surfaceMuted,
-    borderRadius: 10,
+    borderRadius: 12,
     paddingHorizontal: 12,
+    borderWidth: 1,
+    borderColor: 'transparent',
   },
   input: {
     flex: 1,
-    paddingVertical: 10,
+    paddingVertical: 11,
     fontSize: 15,
     color: Colors.text,
     fontWeight: '600',
@@ -789,15 +891,14 @@ const styles = StyleSheet.create({
     marginLeft: 4,
   },
 
-  // Chip selector
   chipRow: {
     flexDirection: 'row',
     gap: 8,
     marginBottom: 4,
   },
   chip: {
-    paddingHorizontal: 14,
-    paddingVertical: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
     borderRadius: 999,
     borderWidth: 1,
     borderColor: Colors.border,
@@ -806,6 +907,14 @@ const styles = StyleSheet.create({
   chipActive: {
     backgroundColor: Colors.primary,
     borderColor: Colors.primary,
+    shadowColor: Colors.primary,
+    shadowOffset: {
+      width: 0,
+      height: 4,
+    },
+    shadowOpacity: 0.18,
+    shadowRadius: 10,
+    elevation: 3,
   },
   chipText: {
     fontSize: 13,
@@ -816,13 +925,17 @@ const styles = StyleSheet.create({
     color: '#fff',
   },
 
-  // Expandable section
-  expandRow: {
+  expandLeft: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 6,
+  },
+  expandRow: {
     marginTop: 14,
-    paddingVertical: 6,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    borderRadius: 12,
+    backgroundColor: Colors.surfaceMuted,
   },
   expandText: {
     fontSize: 13,
@@ -830,13 +943,12 @@ const styles = StyleSheet.create({
     color: Colors.primary,
   },
   optionalSection: {
-    marginTop: 8,
-    paddingTop: 12,
+    marginTop: 14,
+    paddingTop: 14,
     borderTopWidth: 1,
     borderTopColor: Colors.border,
   },
 
-  // Verdict
   verdictRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -850,7 +962,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingVertical: 8,
     borderRadius: 999,
-    borderWidth: 1.5,
   },
   verdictText: {
     fontSize: 14,
@@ -873,7 +984,6 @@ const styles = StyleSheet.create({
     fontVariant: ['tabular-nums'],
   },
 
-  // Reasons
   reasonsBlock: {
     marginBottom: 14,
     padding: 12,
@@ -901,7 +1011,6 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
 
-  // Unit picker
   unitPickerTitle: {
     fontSize: 11,
     fontWeight: '700',
@@ -948,7 +1057,6 @@ const styles = StyleSheet.create({
     color: '#fff',
   },
 
-  // Risk score
   scoreRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -973,8 +1081,16 @@ const styles = StyleSheet.create({
   },
   scoreMetaBlock: {
     flex: 1,
-    gap: 2,
+    gap: 10,
+    justifyContent: 'center',
   },
+  
+  metaRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  
   metaLabel: {
     fontSize: 10,
     fontWeight: '700',
@@ -982,14 +1098,14 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.4,
   },
+  
   metaValue: {
-    fontSize: 16,
+    fontSize: 15,
     fontWeight: '700',
     color: Colors.text,
-    marginBottom: 4,
   },
 
-  // Top factors
+
   factorsBlock: {
     marginBottom: 14,
     gap: 4,
@@ -1000,7 +1116,6 @@ const styles = StyleSheet.create({
     fontWeight: '600',
   },
 
-  // Survival
   survivalBlock: {
     marginBottom: 12,
     padding: 12,
@@ -1024,7 +1139,6 @@ const styles = StyleSheet.create({
     fontVariant: ['tabular-nums'],
   },
 
-  // Urgency
   urgencyBar: {
     flexDirection: 'row',
     alignItems: 'flex-start',
@@ -1041,7 +1155,6 @@ const styles = StyleSheet.create({
     lineHeight: 17,
   },
 
-  // Disclaimer
   disclaimer: {
     fontSize: 11,
     color: Colors.textMuted,
@@ -1049,7 +1162,6 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
 
-  // Save button (new)
   saveButton: {
     flexDirection: 'row',
     gap: 8,
@@ -1069,7 +1181,6 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
 
-  // Info modal
   modalBackdrop: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.5)',
@@ -1104,5 +1215,32 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 15,
     fontWeight: '700',
+  },
+
+  nameField: {
+    marginBottom: 12,
+  },
+  nameInput: {
+    backgroundColor: Colors.surfaceMuted,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 15,
+    fontWeight: '600',
+    color: Colors.text,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+
+  monitorImageWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: -4,
+    marginBottom: 18,
+  },
+  monitorImage: {
+    width: 175,
+    height: 110,
+    resizeMode: 'contain',
   },
 });

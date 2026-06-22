@@ -64,18 +64,57 @@ export interface EligibilityResult {
 // --- Call (encounter) state ----------------------------------------------
 
 /**
+ * Snapshot of the in-progress transfusion. Written by ChecklistScreen as
+ * the medic works through monitoring; read by AlertScreen so the radio
+ * handoff summary can include real-time transfusion data.
+ *
+ * Lives in AppContext so it survives tab switches and persists to
+ * AsyncStorage with the rest of the call state.
+ */
+export interface TransfusionState {
+  /** Whether monitoring is currently active. */
+  active: boolean;
+  /** ISO timestamp when transfusion was initiated. Null if not started. */
+  startedAt: string | null;
+  /** Seconds since transfusion started. Updated periodically. */
+  elapsedSec: number;
+  /** mL infused so far. Calculated from elapsed time and rate. */
+  volumeInfusedMl: number;
+  /**
+   * The worst severity observed during this transfusion. Sticks around
+   * even after the reaction resolves — clinically the receiving ER cares
+   * about peak severity, not current.
+   */
+  peakSeverity: 'none' | 'mild' | 'moderate' | 'severe';
+  /** Type of reaction at peak severity. */
+  peakReactionType: string | null;
+  /** When the peak was observed. ISO timestamp. */
+  peakObservedAt: string | null;
+  /**
+   * Medic's free-text observation note. Edited via Checklist monitoring
+   * view; included verbatim in the radio summary if present.
+   */
+  medicNote: string;
+}
+
+/**
  * State of the current EMS encounter. One active call at a time.
  * Persisted in AsyncStorage so the app survives backgrounding.
  */
 export interface CallState {
-  active: boolean;
-  /** ISO timestamp when the call was started. Null when no call active. */
-  startTime: string | null;
-  patientVitals: PatientVitals | null;
-  eligibilityResult: EligibilityResult | null;
-  /** The specific unit the medic chose to hang. */
-  selectedBloodUnit: BloodUnit | null;
-}
+    active: boolean;
+    startTime: string | null;
+    /**
+     * Patient name as known to the medic. May be partial ("Smith"),
+     * formal ("Mr. Smith"), or full ("John Smith"). Empty string when
+     * unknown — the radio summary phrases this gracefully either way.
+     */
+    patientName: string;
+    patientVitals: PatientVitals | null;
+    eligibilityResult: EligibilityResult | null;
+    selectedBloodUnit: BloodUnit | null;
+    transfusion: TransfusionState;
+  }
 
 // --- Location -------------------------------------------------------------
 

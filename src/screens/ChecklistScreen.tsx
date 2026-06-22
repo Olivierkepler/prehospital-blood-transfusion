@@ -6,26 +6,15 @@
  *         to a live monitoring view driven by useReactionMonitor.
  *
  * Baseline vitals come from callState.patientVitals (set on the Eligibility
- * tab) when available; otherwise the screen shows an inline capture form so
- * monitoring is always possible. The reaction monitor's baseline snapshot
- * (with RR, SpO2, temp defaults filled in) is the source of truth for
- * delta calculations on screen — not the truncated PatientVitals.
+ * tab) when available; otherwise the screen shows an inline capture form.
  *
- * Checklist completion state is local to this screen — it resets on tab
- * switch. Persisting per-call requires a stepCompletion map in callState;
- * easy to add later if needed.
+ * Transfusion state is mirrored into AppContext.callState.transfusion so
+ * the Alert screen's radio summary can include real-time transfusion data
+ * (elapsed, volume, peak severity, medic note). Writes are throttled to
+ * once every 30s during steady-state, plus immediate writes on transfusion
+ * start, end, severity escalations, and medic-note edits.
  */
 
-import React, { useMemo, useState } from 'react';
-import {
-  Pressable,
-  ScrollView,
-  StyleSheet,
-  Switch,
-  Text,
-  TextInput,
-  View,
-} from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 
 import { Colors } from '../theme/colors';
@@ -34,8 +23,27 @@ import { CHECKLIST_STEPS } from '../constants/protocols';
 import { InjuryType, PatientVitals } from '../types';
 import { useReactionMonitor, SimulationMode } from '../hooks/useReactionMonitor';
 import { formatReactionType, ReactionSeverity } from '../ml';
-
+import HomeIVScene from '../components/IVPump/HomeIVScene';
+import SigmaPump, {
+  PUMP_BASE_HEIGHT,
+  PUMP_BASE_WIDTH,
+ } from '../components/IVPump/SigmaPump';
+ import React, { useEffect, useMemo, useRef, useState } from 'react';
+ import {
+   Alert,
+   Animated,
+   Linking,
+   Pressable,
+   ScrollView,
+   StyleSheet,
+   Switch,
+   Text,
+   TextInput,
+   TouchableOpacity,
+   View,
+ } from 'react-native';
 // --- Small helpers ------------------------------------------------------
+
 
 function parseNumber(raw: string): number | undefined {
   const trimmed = raw.trim();
@@ -77,24 +85,39 @@ function severityLabel(severity: ReactionSeverity): string {
   }
 }
 
+/** Severity ordering helper — lets us detect escalations. */
+const SEVERITY_RANK: Record<ReactionSeverity, number> = {
+  none: 0,
+  mild: 1,
+  moderate: 2,
+  severe: 3,
+};
+
+const CONTEXT_FLUSH_INTERVAL_MS = 30_000;
+const BLOOD_START_ML = 250;
+const BLOOD_MAX_ML = 450;
+const SALINE_START_ML = 500;
+const SALINE_MAX_ML = 1000;
+
+const PUMP_WRAP_W = Math.ceil(PUMP_BASE_WIDTH * 1.15);
+const PUMP_WRAP_H = Math.ceil(PUMP_BASE_HEIGHT * 1.15);
 // --- Screen -------------------------------------------------------------
 
 export default function ChecklistScreen() {
-  const { callState } = useApp();
+  const { callState, setTransfusionState } = useApp();
 
-  // Checklist state: stepId → completed.
   const [completed, setCompleted] = useState<Record<string, boolean>>({});
-
-  // Monitoring mode state.
   const [monitoring, setMonitoring] = useState(false);
   const [simulationMode, setSimulationMode] = useState<SimulationMode>('normal');
   const [speechEnabled, setSpeechEnabled] = useState(false);
 
-  // Inline baseline form (only used when callState.patientVitals is null).
   const [hrInput, setHrInput] = useState('');
   const [sbpInput, setSbpInput] = useState('');
 
-  // Resolve baseline vitals: prefer callState, fall back to inline form.
+  // Medic note — free-text observations during transfusion. Synced to
+  // context so it appears in the radio summary.
+  const [medicNote, setMedicNoteLocal] = useState(callState.transfusion.medicNote);
+
   const baselineFromCall = callState.patientVitals;
   const inlineBaseline = useMemo<PatientVitals | null>(() => {
     const hr = parseNumber(hrInput);
@@ -105,7 +128,6 @@ export default function ChecklistScreen() {
 
   const baseline = baselineFromCall ?? inlineBaseline;
 
-  // Drive the monitor hook.
   const monitor = useReactionMonitor({
     active: monitoring,
     baselineVitals: baseline,
@@ -113,12 +135,97 @@ export default function ChecklistScreen() {
     speechEnabled,
   });
 
-  // Derived progress.
+  // Track peak severity locally so we can spot escalations and flush
+  // immediately when one happens.
+  const peakSeverityRef = useRef<ReactionSeverity>('none');
+  const lastContextFlushRef = useRef<number>(0);
+  const pumpScaleAnim = useRef(new Animated.Value(0.82)).current;
+  const [pumpExpanded, setPumpExpanded] = useState(false);
+  
+  const expandPump = () => {
+    Animated.spring(pumpScaleAnim, {
+      toValue: pumpExpanded ? 0.82 : 1.15,
+      useNativeDriver: true,
+      friction: 7,
+      tension: 80,
+    }).start();
+  
+    setPumpExpanded((value) => !value);
+  };
+  // --- Effect: monitor → context bridge ---------------------------------
+
+  // On transfusion start: write initial state to context.
+  useEffect(() => {
+    if (monitoring) {
+      const startedAt = new Date().toISOString();
+      peakSeverityRef.current = 'none';
+      lastContextFlushRef.current = Date.now();
+      setTransfusionState({
+        active: true,
+        startedAt,
+        elapsedSec: 0,
+        volumeInfusedMl: 0,
+        peakSeverity: 'none',
+        peakReactionType: null,
+        peakObservedAt: null,
+      });
+    } else {
+      // On transfusion end: keep peak data but flip active off.
+      setTransfusionState({ active: false });
+    }
+    // setTransfusionState is stable from context — safe to omit
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [monitoring]);
+
+  // On every monitor tick: throttle writes + immediate write on escalation.
+  useEffect(() => {
+    if (!monitoring || !monitor.output) return;
+
+    const currentSeverity = monitor.output.severity;
+    const isEscalation =
+      SEVERITY_RANK[currentSeverity] > SEVERITY_RANK[peakSeverityRef.current];
+
+    const now = Date.now();
+    const shouldFlush =
+      isEscalation || now - lastContextFlushRef.current >= CONTEXT_FLUSH_INTERVAL_MS;
+
+    if (!shouldFlush) return;
+
+    lastContextFlushRef.current = now;
+
+    if (isEscalation) {
+      peakSeverityRef.current = currentSeverity;
+      setTransfusionState({
+        elapsedSec: monitor.elapsedSec,
+        volumeInfusedMl: monitor.volumeInfusedMl,
+        peakSeverity: currentSeverity,
+        peakReactionType: monitor.output.reactionType,
+        peakObservedAt: new Date().toISOString(),
+      });
+    } else {
+      setTransfusionState({
+        elapsedSec: monitor.elapsedSec,
+        volumeInfusedMl: monitor.volumeInfusedMl,
+      });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [monitoring, monitor.output, monitor.elapsedSec, monitor.volumeInfusedMl]);
+
+  // Medic note → context, debounced.
+  useEffect(() => {
+    const handle = setTimeout(() => {
+      setTransfusionState({ medicNote });
+    }, 400);
+    return () => clearTimeout(handle);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [medicNote]);
+
+  // --- Derived progress -------------------------------------------------
+
   const completedCount = Object.values(completed).filter(Boolean).length;
   const totalSteps = CHECKLIST_STEPS.length;
   const progressPct = Math.round((completedCount / totalSteps) * 100);
 
-  // "Begin infusion" is step index 4 (id: 'begin-infusion').
   const infusionStepDone = completed['begin-infusion'] === true;
   const canBeginTransfusion = infusionStepDone && baseline !== null && !monitoring;
 
@@ -141,13 +248,17 @@ export default function ChecklistScreen() {
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.scrollContent}
+        keyboardShouldPersistTaps="handled"
       >
-        <MonitoringCard
-          elapsedSec={monitor.elapsedSec}
-          volumeMl={monitor.volumeInfusedMl}
-          current={monitor.currentSnapshot}
-          baselineSnapshot={monitor.history[0] ?? null}
-        />
+      <MonitoringCard
+  elapsedSec={monitor.elapsedSec}
+  volumeMl={monitor.volumeInfusedMl}
+  current={monitor.currentSnapshot}
+  baselineSnapshot={monitor.history[0] ?? null}
+  pumpScaleAnim={pumpScaleAnim}
+  onPumpPress={expandPump}
+  
+/>
 
         {monitor.output && monitor.output.severity !== 'none' && (
           <ReactionAlertCard output={monitor.output} />
@@ -161,6 +272,11 @@ export default function ChecklistScreen() {
             </Text>
           </View>
         )}
+
+        <MedicNoteCard
+          value={medicNote}
+          onChange={setMedicNoteLocal}
+        />
 
         <ControlsCard
           simulationMode={simulationMode}
@@ -191,7 +307,6 @@ export default function ChecklistScreen() {
       contentContainerStyle={styles.scrollContent}
       keyboardShouldPersistTaps="handled"
     >
-      {/* Progress card */}
       <View style={styles.card}>
         <View style={styles.progressHeader}>
           <Text style={styles.progressLabel}>
@@ -201,15 +316,11 @@ export default function ChecklistScreen() {
         </View>
         <View style={styles.progressBar}>
           <View
-            style={[
-              styles.progressFill,
-              { width: `${progressPct}%` },
-            ]}
+            style={[styles.progressFill, { width: `${progressPct}%` }]}
           />
         </View>
       </View>
 
-      {/* Baseline-vitals capture (only if callState has none) */}
       {!baselineFromCall && (
         <View style={[styles.card, styles.baselineCard]}>
           <View style={styles.baselineHeader}>
@@ -249,7 +360,6 @@ export default function ChecklistScreen() {
         </View>
       )}
 
-      {/* Steps */}
       {CHECKLIST_STEPS.map((step, index) => (
         <StepCard
           key={step.id}
@@ -260,7 +370,6 @@ export default function ChecklistScreen() {
         />
       ))}
 
-      {/* Begin transfusion button — only after step 5 is checked */}
       {infusionStepDone && (
         <Pressable
           style={({ pressed }) => [
@@ -303,12 +412,7 @@ function StepCard({
         pressed && { opacity: 0.85 },
       ]}
     >
-      <View
-        style={[
-          styles.stepCheckbox,
-          completed && styles.stepCheckboxDone,
-        ]}
-      >
+      <View style={[styles.stepCheckbox, completed && styles.stepCheckboxDone]}>
         {completed ? (
           <Ionicons name="checkmark" size={14} color="#fff" />
         ) : (
@@ -316,12 +420,7 @@ function StepCard({
         )}
       </View>
       <View style={styles.stepBody}>
-        <Text
-          style={[
-            styles.stepTitle,
-            completed && styles.stepTitleDone,
-          ]}
-        >
+        <Text style={[styles.stepTitle, completed && styles.stepTitleDone]}>
           {step.title}
         </Text>
         <Text style={styles.stepDescription}>{step.description}</Text>
@@ -335,12 +434,23 @@ function MonitoringCard({
   volumeMl,
   current,
   baselineSnapshot,
+  pumpScaleAnim,
+  onPumpPress,
 }: {
   elapsedSec: number;
   volumeMl: number;
   current: ReturnType<typeof useReactionMonitor>['currentSnapshot'];
   baselineSnapshot: ReturnType<typeof useReactionMonitor>['currentSnapshot'];
+  pumpScaleAnim: Animated.Value;
+  onPumpPress: () => void;
 }) {
+  const bloodInfusedMl = Math.min(volumeMl, BLOOD_START_ML);
+
+  const salineInfusedMl = Math.min(
+    Math.round((elapsedSec / 3600) * 125),
+    SALINE_START_ML
+  );
+
   return (
     <View style={styles.card}>
       <View style={styles.monitorHeaderRow}>
@@ -355,11 +465,57 @@ function MonitoringCard({
             {formatElapsed(elapsedSec)}
           </Text>
         </View>
+
         <View style={styles.monitorMetric}>
           <Text style={styles.monitorMetricLabel}>Infused</Text>
-          <Text style={styles.monitorMetricValue}>{volumeMl} mL</Text>
+          <Text style={styles.monitorMetricValue}>
+            {volumeMl} mL
+          </Text>
         </View>
       </View>
+
+      <View style={styles.ivSceneWrap}>
+        <HomeIVScene
+          bloodType="O-"
+          bloodVolume={BLOOD_START_ML}
+          bloodMaxVolume={BLOOD_MAX_ML}
+          bloodInfusedMl={bloodInfusedMl}
+          bloodUnitId="BB-9031"
+          bloodProductName="Packed Red Cells"
+          salineVolume={SALINE_START_ML}
+          salineMaxVolume={SALINE_MAX_ML}
+          salineInfusedMl={salineInfusedMl}
+          salineUnitId="NS-7781"
+          salineProductName="Sodium Chloride Injection"
+          salineConcentration="0.9% NaCl"
+          width={360}
+          height={360}
+        />
+      </View>
+
+      <TouchableOpacity
+        activeOpacity={0.9}
+        onPress={onPumpPress}
+        style={styles.pumpTouchable}
+      >
+        <View style={styles.pumpCard}>
+          <Animated.View
+            style={[
+              styles.pumpWrap,
+              {
+                transform: [{ scale: pumpScaleAnim }],
+              },
+            ]}
+          >
+            <SigmaPump
+              drug="Packed RBC"
+              value={volumeMl}
+              unit="mL infused"
+              mode="LIVE"
+            />
+          </Animated.View>
+        </View>
+      </TouchableOpacity>
 
       {current && baselineSnapshot && (
         <View style={styles.vitalsCompareRow}>
@@ -368,16 +524,19 @@ function MonitoringCard({
             current={current.heartRate}
             baseline={baselineSnapshot.heartRate}
           />
+
           <VitalCompare
             label="SBP"
             current={current.systolicBP}
             baseline={baselineSnapshot.systolicBP}
           />
+
           <VitalCompare
             label="RR"
             current={current.respiratoryRate}
             baseline={baselineSnapshot.respiratoryRate}
           />
+
           <VitalCompare
             label="SpO₂"
             current={current.spo2}
@@ -484,10 +643,61 @@ function ReactionAlertCard({
           )}
 
           {output.callMedControl && (
-            <View style={[styles.flag, { backgroundColor: Colors.warning }]}>
-              <Ionicons name="call" size={14} color="#fff" />
-              <Text style={styles.flagText}>MED CONTROL</Text>
-            </View>
+ <Pressable
+ style={({ pressed }) => [
+   styles.flag,
+   styles.medControlButton,
+   pressed && styles.buttonPressed,
+ ]}
+ onPress={() =>
+   Alert.alert(
+     'Medical Control',
+     'Choose a communication method for physician contact.',
+     [
+       {
+         text: 'Voice Call',
+         onPress: () =>
+           Linking.openURL('tel:6174590219'),
+       },
+       {
+         text: 'FaceTime Video',
+         onPress: () =>
+           Linking.openURL('facetime:6174590219'),
+       },
+       {
+         text: 'Cancel',
+         style: 'cancel',
+       },
+     ]
+   )
+ }
+>
+ <View style={styles.medControlContent}>
+   <View style={styles.medControlIcon}>
+     <Ionicons
+       name="medkit"
+       size={15}
+       color="#fff"
+     />
+   </View>
+
+   <View style={styles.medControlTextWrap}>
+     <Text style={styles.flagText}>
+       MED CONTROL
+     </Text>
+
+     <Text style={styles.medControlSubtext}>
+       Tap to call or start video consult
+     </Text>
+   </View>
+ </View>
+
+ <Ionicons
+   name="chevron-forward"
+   size={16}
+   color="rgba(255,255,255,0.9)"
+ />
+</Pressable>
           )}
         </View>
       )}
@@ -505,6 +715,123 @@ function ReactionAlertCard({
     </View>
   );
 }
+
+function MedicNoteCard({
+    value,
+    onChange,
+  }: {
+    value: string;
+    onChange: (text: string) => void;
+  }) {
+    // Collapsed by default — frees up screen real estate during normal
+    // monitoring. The user expands when they want to type or review.
+    // Resets to collapsed on every entry to monitoring mode (i.e. every
+    // component mount), which is intentional — fresh focus on vitals.
+    const [expanded, setExpanded] = useState(false);
+  
+    // Ref to programmatically focus the input from the "Dictate" button.
+    // Tapping summons the keyboard one tap sooner than tapping into the
+    // input itself. The iOS keyboard's built-in mic does the actual STT.
+    const inputRef = useRef<TextInput>(null);
+  
+    const handleDictatePress = () => {
+      inputRef.current?.focus();
+    };
+  
+    // When expanding via "Show note", also focus the input so the medic
+    // can type immediately. When expanding to view an existing note, don't
+    // steal focus — they might just be reading.
+    const handleToggleExpanded = () => {
+      setExpanded((prev) => !prev);
+    };
+  
+    const hasContent = value.trim().length > 0;
+    const previewText = hasContent
+      ? value.length > 60
+        ? `${value.slice(0, 60).trim()}…`
+        : value
+      : null;
+  
+    return (
+      <View style={[styles.card, styles.noteCard]}>
+        {/* Collapsed/expanded header — always visible, tappable */}
+        <Pressable
+          onPress={handleToggleExpanded}
+          style={({ pressed }) => [
+            styles.noteHeaderRow,
+            pressed && { opacity: 0.85 },
+          ]}
+        >
+          <Ionicons
+            name="document-text-outline"
+            size={16}
+            color={Colors.warning}
+          />
+          <View style={styles.noteHeaderText}>
+            <Text style={styles.noteTitle}>Observation note</Text>
+            {!expanded && previewText && (
+              <Text style={styles.notePreview} numberOfLines={1}>
+                {previewText}
+              </Text>
+            )}
+            {!expanded && !previewText && (
+              <Text style={styles.notePreviewEmpty}>
+                Tap to add observations
+              </Text>
+            )}
+          </View>
+          {hasContent && (
+            <View style={styles.noteCountBadge}>
+              <Text style={styles.noteCountText}>
+                {value.length}
+              </Text>
+            </View>
+          )}
+          <Ionicons
+            name={expanded ? 'chevron-up' : 'chevron-down'}
+            size={18}
+            color={Colors.warning}
+          />
+        </Pressable>
+  
+        {/* Expanded body */}
+        {expanded && (
+          <View style={styles.noteBody}>
+            <Text style={styles.noteHint}>
+              Free-text observations to include in the radio handoff summary
+              (e.g. "patient reports chest tightness," "slowed infusion rate at 2 min").
+            </Text>
+  
+            <TextInput
+              ref={inputRef}
+              style={styles.noteInput}
+              value={value}
+              onChangeText={onChange}
+              multiline
+              textAlignVertical="top"
+              autoCorrect
+              autoCapitalize="sentences"
+              placeholder="Tap to add a note…"
+              placeholderTextColor={Colors.textMuted}
+            />
+  
+            <Pressable
+              style={({ pressed }) => [
+                styles.dictateButton,
+                pressed && { opacity: 0.85 },
+              ]}
+              onPress={handleDictatePress}
+            >
+              <Ionicons name="mic-outline" size={16} color={Colors.warning} />
+              <Text style={styles.dictateButtonText}>
+                Tap to dictate — use the mic on the keyboard
+              </Text>
+            </Pressable>
+          </View>
+        )}
+      </View>
+    );
+  }
 
 function ControlsCard({
   simulationMode,
@@ -566,16 +893,16 @@ function ControlsCard({
 // --- Styles -------------------------------------------------------------
 
 const styles = StyleSheet.create({
-  scroll: {
+  scroll: { 
     flex: 1,
     backgroundColor: Colors.background,
+    marginTop: 110,
+    marginBottom: 100,
+    zIndex: 1,
+    borderTopLeftRadius: 28,
+    borderTopRightRadius: 28,
   },
-  scrollContent: {
-    padding: 14,
-    paddingBottom: 32,
-    gap: 12,
-  },
-
+  scrollContent: { padding: 14, paddingBottom: 32, gap: 12 },
   card: {
     backgroundColor: Colors.surface,
     borderRadius: 16,
@@ -584,18 +911,13 @@ const styles = StyleSheet.create({
     borderColor: Colors.border,
   },
 
-  // Progress card
   progressHeader: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     marginBottom: 10,
   },
-  progressLabel: {
-    fontSize: 13,
-    fontWeight: '700',
-    color: Colors.text,
-  },
+  progressLabel: { fontSize: 13, fontWeight: '700', color: Colors.text },
   progressPct: {
     fontSize: 13,
     fontWeight: '800',
@@ -608,12 +930,8 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.surfaceMuted,
     overflow: 'hidden',
   },
-  progressFill: {
-    height: '100%',
-    backgroundColor: Colors.primary,
-  },
+  progressFill: { height: '100%', backgroundColor: Colors.primary },
 
-  // Baseline form
   baselineCard: {
     backgroundColor: '#EFF6FF',
     borderColor: Colors.primaryLight,
@@ -624,24 +942,15 @@ const styles = StyleSheet.create({
     gap: 8,
     marginBottom: 6,
   },
-  baselineTitle: {
-    fontSize: 14,
-    fontWeight: '800',
-    color: Colors.primary,
-  },
+  baselineTitle: { fontSize: 14, fontWeight: '800', color: Colors.primary },
   baselineHint: {
     fontSize: 12,
     color: Colors.textSecondary,
     lineHeight: 17,
     marginBottom: 10,
   },
-  baselineRow: {
-    flexDirection: 'row',
-    gap: 10,
-  },
-  baselineField: {
-    flex: 1,
-  },
+  baselineRow: { flexDirection: 'row', gap: 10 },
+  baselineField: { flex: 1 },
   baselineFieldLabel: {
     fontSize: 11,
     fontWeight: '700',
@@ -662,7 +971,6 @@ const styles = StyleSheet.create({
     borderColor: Colors.border,
   },
 
-  // Step card
   stepCard: {
     flexDirection: 'row',
     gap: 12,
@@ -672,10 +980,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Colors.border,
   },
-  stepCardDone: {
-    opacity: 0.65,
-    backgroundColor: Colors.surfaceMuted,
-  },
+  stepCardDone: { opacity: 0.65, backgroundColor: Colors.surfaceMuted },
   stepCheckbox: {
     width: 28,
     height: 28,
@@ -690,31 +995,12 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.success,
     borderColor: Colors.success,
   },
-  stepNumber: {
-    fontSize: 13,
-    fontWeight: '800',
-    color: Colors.textSecondary,
-  },
-  stepBody: {
-    flex: 1,
-    gap: 4,
-  },
-  stepTitle: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: Colors.text,
-  },
-  stepTitleDone: {
-    textDecorationLine: 'line-through',
-    color: Colors.textMuted,
-  },
-  stepDescription: {
-    fontSize: 12,
-    color: Colors.textSecondary,
-    lineHeight: 17,
-  },
+  stepNumber: { fontSize: 13, fontWeight: '800', color: Colors.textSecondary },
+  stepBody: { flex: 1, gap: 4 },
+  stepTitle: { fontSize: 15, fontWeight: '700', color: Colors.text },
+  stepTitleDone: { textDecorationLine: 'line-through', color: Colors.textMuted },
+  stepDescription: { fontSize: 12, color: Colors.textSecondary, lineHeight: 17 },
 
-  // Begin transfusion button
   beginButton: {
     flexDirection: 'row',
     gap: 8,
@@ -725,20 +1011,10 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.success,
     marginTop: 4,
   },
-  beginButtonDisabled: {
-    backgroundColor: Colors.borderStrong,
-  },
-  beginButtonText: {
-    color: '#fff',
-    fontSize: 15,
-    fontWeight: '800',
-  },
+  beginButtonDisabled: { backgroundColor: Colors.borderStrong },
+  beginButtonText: { color: '#fff', fontSize: 15, fontWeight: '800' },
+  buttonPressed: { opacity: 0.85 },
 
-  buttonPressed: {
-    opacity: 0.85,
-  },
-
-  // Monitoring card
   monitorHeaderRow: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -758,11 +1034,7 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.4,
   },
-  monitorMetricsRow: {
-    flexDirection: 'row',
-    gap: 16,
-    marginBottom: 14,
-  },
+  monitorMetricsRow: { flexDirection: 'row', gap: 16, marginBottom: 14 },
   monitorMetric: {
     flex: 1,
     backgroundColor: Colors.surfaceMuted,
@@ -783,10 +1055,7 @@ const styles = StyleSheet.create({
     color: Colors.text,
     fontVariant: ['tabular-nums'],
   },
-  vitalsCompareRow: {
-    flexDirection: 'row',
-    gap: 8,
-  },
+  vitalsCompareRow: { flexDirection: 'row', gap: 8 },
   vitalCompare: {
     flex: 1,
     alignItems: 'center',
@@ -814,7 +1083,6 @@ const styles = StyleSheet.create({
     fontVariant: ['tabular-nums'],
   },
 
-  // Stable card
   stableCard: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -822,25 +1090,15 @@ const styles = StyleSheet.create({
     backgroundColor: '#F0FDF4',
     borderColor: Colors.success,
   },
-  stableText: {
-    flex: 1,
-    fontSize: 13,
-    color: Colors.text,
-    fontWeight: '600',
-  },
+  stableText: { flex: 1, fontSize: 13, color: Colors.text, fontWeight: '600' },
 
-  // Alert card
   alertHeaderRow: {
     flexDirection: 'row',
     alignItems: 'center',
     gap: 10,
     marginBottom: 12,
   },
-  alertSeverity: {
-    fontSize: 13,
-    fontWeight: '900',
-    letterSpacing: 0.4,
-  },
+  alertSeverity: { fontSize: 13, fontWeight: '900', letterSpacing: 0.4 },
   alertType: {
     fontSize: 12,
     fontWeight: '600',
@@ -858,9 +1116,7 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontVariant: ['tabular-nums'],
   },
-  signsBlock: {
-    marginBottom: 12,
-  },
+  signsBlock: { marginBottom: 12 },
   signsLabel: {
     fontSize: 10,
     fontWeight: '700',
@@ -869,11 +1125,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.4,
     marginBottom: 6,
   },
-  signsRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 6,
-  },
+  signsRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6 },
   signChip: {
     paddingHorizontal: 8,
     paddingVertical: 4,
@@ -882,14 +1134,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: Colors.border,
   },
-  signChipText: {
-    fontSize: 11,
-    fontWeight: '700',
-    color: Colors.text,
-  },
-  actionBlock: {
-    marginBottom: 10,
-  },
+  signChipText: { fontSize: 11, fontWeight: '700', color: Colors.text },
+  actionBlock: { marginBottom: 10 },
   actionLabel: {
     fontSize: 10,
     fontWeight: '700',
@@ -938,13 +1184,100 @@ const styles = StyleSheet.create({
     letterSpacing: 0.4,
     marginBottom: 4,
   },
-  medicationItem: {
+  medicationItem: { fontSize: 12, color: Colors.text, fontWeight: '600' },
+
+  // Medic note card
+  noteCard: {
+    backgroundColor: '#FFFBEB',
+    borderColor: Colors.warning,
+    borderWidth: 1.5,
+  },
+//   noteHeader: {
+//     flexDirection: 'row',
+//     alignItems: 'center',
+//     gap: 6,
+//     marginBottom: 6,
+//   },
+//   noteTitle: {
+//     fontSize: 13,
+//     fontWeight: '800',
+//     color: '#92400E',
+//     textTransform: 'uppercase',
+//     letterSpacing: 0.4,
+//   },
+//   noteHint: {
+//     fontSize: 12,
+//     color: Colors.textSecondary,
+//     lineHeight: 17,
+//     marginBottom: 10,
+//   },
+// Note card — collapsible header + body
+noteHeaderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+ 
+  },
+  noteHeaderText: {
+    flex: 1,
+    gap: 2,
+  },
+  noteTitle: {
+    fontSize: 13,
+    fontWeight: '800',
+    color: '#92400E',
+    textTransform: 'uppercase',
+    letterSpacing: 0.4,
+  },
+  notePreview: {
     fontSize: 12,
     color: Colors.text,
     fontWeight: '600',
   },
+  notePreviewEmpty: {
+    fontSize: 11,
+    color: Colors.textMuted,
+    fontStyle: 'italic',
+  },
+  noteCountBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 999,
+    backgroundColor: Colors.warning,
+    minWidth: 28,
+    alignItems: 'center',
+  },
+  noteCountText: {
+    color: '#fff',
+    fontSize: 11,
+    fontWeight: '800',
+    fontVariant: ['tabular-nums'],
+  },
+  noteBody: {
+    marginTop: 12,
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: Colors.warning,
+  },
+  noteHint: {
+    fontSize: 12,
+    color: Colors.textSecondary,
+    lineHeight: 17,
+    marginBottom: 10,
+  },
+  noteInput: {
+    backgroundColor: Colors.surface,
+    borderRadius: 10,
+    padding: 12,
+    borderWidth: 1,
+    borderColor: Colors.border,
+    fontSize: 14,
+    color: Colors.text,
+    lineHeight: 21,
+    fontWeight: '500',
+    minHeight: 80,
+  },
 
-  // Controls
   controlsTitle: {
     fontSize: 14,
     fontWeight: '800',
@@ -965,17 +1298,8 @@ const styles = StyleSheet.create({
     textTransform: 'uppercase',
     letterSpacing: 0.4,
   },
-  controlSubLabel: {
-    fontSize: 11,
-    color: Colors.textSecondary,
-    marginTop: 1,
-  },
-  simRow: {
-    flexDirection: 'row',
-    gap: 8,
-    marginTop: 6,
-    marginBottom: 14,
-  },
+  controlSubLabel: { fontSize: 11, color: Colors.textSecondary, marginTop: 1 },
+  simRow: { flexDirection: 'row', gap: 8, marginTop: 6, marginBottom: 14 },
   simChip: {
     paddingHorizontal: 14,
     paddingVertical: 8,
@@ -988,14 +1312,8 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.primary,
     borderColor: Colors.primary,
   },
-  simChipText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: Colors.text,
-  },
-  simChipTextActive: {
-    color: '#fff',
-  },
+  simChipText: { fontSize: 12, fontWeight: '700', color: Colors.text },
+  simChipTextActive: { color: '#fff' },
   switchRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -1005,7 +1323,6 @@ const styles = StyleSheet.create({
     borderTopColor: Colors.border,
   },
 
-  // End transfusion
   endButton: {
     flexDirection: 'row',
     gap: 8,
@@ -1015,9 +1332,92 @@ const styles = StyleSheet.create({
     borderRadius: 14,
     backgroundColor: Colors.danger,
   },
-  endButtonText: {
-    color: '#fff',
-    fontSize: 15,
-    fontWeight: '800',
+  endButtonText: { color: '#fff', fontSize: 15, fontWeight: '800' },
+  dictateButton: {
+    flexDirection: 'row',
+    gap: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 10,
+    borderRadius: 10,
+    backgroundColor: '#FEF3C7',
+    borderWidth: 1,
+    borderColor: Colors.warning,
+    marginTop: 10,
+  },
+  dictateButtonText: {
+    color: '#92400E',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  medControlButton: {
+    backgroundColor: Colors.warning,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 16,
+  
+    shadowColor: Colors.warning,
+    shadowOffset: {
+      width: 0,
+      height: 4,
+    },
+    shadowOpacity: 0.18,
+    shadowRadius: 10,
+    elevation: 3,
+  },
+  
+  medControlContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flex: 1,
+  },
+  
+  medControlIcon: {
+    width: 30,
+    height: 30,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.18)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  
+  medControlTextWrap: {
+    flex: 1,
+  },
+  
+  medControlSubtext: {
+    color: 'rgba(255,255,255,0.82)',
+    fontSize: 11,
+    fontWeight: '600',
+    marginTop: 1,
+  },
+  ivSceneWrap: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 4,
+    marginBottom: 12,
+    overflow: 'hidden',
+  },
+  
+  pumpTouchable: {
+    alignSelf: 'center',
+  
+    marginTop: -200,
+  
+   
+  },
+  
+  pumpCard: {
+    alignItems: 'center',
+    justifyContent: 'center',
+    overflow: 'visible',
+  },
+  
+  pumpWrap: {
+    width: PUMP_WRAP_W,
+    height: PUMP_WRAP_H,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
 });

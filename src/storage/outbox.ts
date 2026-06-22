@@ -44,26 +44,29 @@ const MAX_ATTEMPTS = 5;
  * and the planned transfusion intervention.
  */
 export interface AlertPayload {
-  /** Unique id for this alert. Lets the receiving system de-dupe retries. */
   callId: string;
-  /** ISO timestamp when the alert was queued. */
   timestamp: string;
-  /** US state name where the call is happening. */
   detectedState: string;
-  /** Patient vitals at time of alert. */
+  /** Patient name as known to the medic. Empty string when unknown. */
+  patientName: string;
   vitals: PatientVitals | null;
-  /** Eligibility decision (verdict + reasons). */
-  eligibility: EligibilityResult | null;
   /** Full ML assessment if available (risk score + survival). */
   mlAssessment?: FullAssessmentOutput;
   /** Transfusion details. */
   transfusion: {
-    /** Unit id selected. */
     unitId: string | null;
-    /** Blood type of the unit. */
     bloodType: string | null;
-    /** True if the medic has initiated the infusion. */
     initiated: boolean;
+    /** Seconds elapsed since transfusion started. */
+    elapsedSec?: number;
+    /** mL infused at time of alert. */
+    volumeInfusedMl?: number;
+    /** Worst severity observed during transfusion. */
+    peakSeverity?: 'none' | 'mild' | 'moderate' | 'severe';
+    /** Type of reaction at peak severity. */
+    peakReactionType?: string | null;
+    /** Medic's free-text observation note. */
+    medicNote?: string;
   };
   /** Protocol context. */
   protocol: {
@@ -72,6 +75,13 @@ export interface AlertPayload {
     /** Whether the patient is under medical-direction order (MDO). */
     mdoActive: boolean;
   };
+  /**
+   * Medic-edited radio handoff paragraph, if present. The structured
+   * fields above are always authoritative; this is a human-readable
+   * narrative the receiving facility can read alongside them.
+   * Optional — older alerts without it remain valid.
+   */
+  radioSummary?: string;
 }
 
 /** Internal queue entry — payload plus retry bookkeeping. */
